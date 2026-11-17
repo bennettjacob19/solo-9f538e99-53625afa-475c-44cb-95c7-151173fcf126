@@ -86,7 +86,10 @@
   .res .meta { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
   .res.ok { border-left: 3px solid var(--green); }
   .res.rejected { border-left: 3px solid var(--amber); }
+  .res.busy { border-left: 3px solid #a78bfa; }
   .res.fail { border-left: 3px solid var(--red); }
+  .pill.busy { background: rgba(167,139,250,.14); color: #c4b5fd; border-color: rgba(167,139,250,.4); }
+  .pill.emergency { background: rgba(248,113,113,.14); color: var(--red); border-color: rgba(248,113,113,.4); }
   pre { margin: 6px 0 0; background: #0b0f1c; border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 12px; overflow: auto; font-size: 11.5px; max-height: 240px; color: #b9c6e6; }
   .statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
@@ -107,7 +110,7 @@
 <body>
 <header>
   <h1>制品元数据熔断网关</h1>
-  <span class="sub">FastAPI · 双 worker · SQLite 共享熔断状态 · 按制品名转发本地目录服务</span>
+  <span class="sub">FastAPI · 双 worker · SQLite 共享熔断与容量席位 · 紧急回滚保留席 · 按制品名转发本地目录服务</span>
 </header>
 
 <main>
@@ -115,13 +118,20 @@
 
   <div class="grid2">
     <section>
-      <h2>查询元数据 <small>并发请求；慢查询不会阻塞其他查询</small></h2>
+      <h2>查询元数据 <small>并发请求；普通查询最多占 1 席，紧急查询可占保留席</small></h2>
       <div class="row">
         <div style="flex:2 1 240px">
           <label for="artifact">制品名（可逗号分隔批量）</label>
           <input id="artifact" type="text" value="example-app.json" autocomplete="off" />
         </div>
-        <div>
+        <div style="flex:0 1 150px">
+          <label for="level">查询级别</label>
+          <select id="level">
+            <option value="normal">普通（部署）</option>
+            <option value="emergency">紧急（回滚）</option>
+          </select>
+        </div>
+        <div style="flex:0 1 110px">
           <label for="count">并发请求数</label>
           <input id="count" type="number" min="1" max="50" value="1" />
         </div>
@@ -133,7 +143,11 @@
         <button data-art="reports-tool.json">reports-tool.json</button>
         <button data-art="missing-artifact.json">不存在的制品</button>
       </div>
-      <div class="hint">每次点击“查询”会发出「并发请求数」个请求；响应会标注由哪个 worker 处理、耗时与熔断作用。</div>
+      <div class="hint">
+        网关全局最多 2 个在途查询，其中普通查询最多 1 个；容量不足时立即返回
+        <code>capacity_busy</code>（503），不访问目录、不计熔断。每次点击会按所选级别发出
+        「并发请求数」个请求，逐条显示结果与席位占用。
+      </div>
       <div id="results"></div>
     </section>
 
@@ -153,18 +167,30 @@
       </div>
       <div class="hint" id="modeHint">当前模式：读取中…</div>
 
-      <h2 style="margin-top:20px">上游实际访问次数 <small>熔断拒绝的请求不应增加</small></h2>
+      <h2 style="margin-top:20px">网关共享席位 <small>两个 worker 共享；最多 2 在途，普通最多 1</small></h2>
       <div class="statgrid">
-        <div class="stat"><div class="v" id="upStreamHits">–</div><div class="k">上游收到的 /artifacts 请求</div></div>
+        <div class="stat"><div class="v" id="gwInflight">–</div><div class="k">当前在途 / 上限</div></div>
+        <div class="stat"><div class="v" id="gwPeak">–</div><div class="k">峰值在途</div></div>
+        <div class="stat"><div class="v" id="gwNormal">–</div><div class="k">其中普通 / 上限</div></div>
+        <div class="stat"><div class="v" id="gwBusy">–</div><div class="k">容量忙碌拒绝（累计）</div></div>
+      </div>
+      <div class="hint" id="seatHint">席位读取中…</div>
+
+      <h2 style="margin-top:20px">目录与转发计数 <small>目录自身最多同时处理 2 个查询</small></h2>
+      <div class="statgrid">
+        <div class="stat"><div class="v" id="upInflight">–</div><div class="k">目录当前在途 / 上限</div></div>
+        <div class="stat"><div class="v" id="upPeak">–</div><div class="k">目录峰值在途</div></div>
+        <div class="stat"><div class="v" id="upStreamHits">–</div><div class="k">目录收到的请求</div></div>
+        <div class="stat"><div class="v" id="upBusy">–</div><div class="k">目录忙碌拒绝（累计）</div></div>
         <div class="stat"><div class="v" id="gwHits">–</div><div class="k">网关转发次数</div></div>
         <div class="stat"><div class="v" id="probeHits">–</div><div class="k">其中恢复探测</div></div>
       </div>
       <div class="row" style="margin-top:12px">
         <button id="refreshStatsBtn">刷新</button>
-        <button id="resetUpstreamBtn">清零上游计数</button>
-        <button class="danger" id="resetAllBtn">重置熔断状态</button>
+        <button id="resetUpstreamBtn">清零计数</button>
+        <button class="danger" id="resetAllBtn">重置熔断与席位</button>
       </div>
-      <div class="hint">提示：将模式切到“返回 503”，连点三次查询即可看到熔断；2 秒后再查询会放行一次探测。</div>
+      <div class="hint">提示：上游切“延迟”后并发 4 个普通查询，可看到仅 1 个占席、其余立即容量忙碌；紧急查询仍可使用保留席。</div>
     </section>
   </div>
 
@@ -216,6 +242,7 @@ async function runQuery() {
   const raw = $("#artifact").value.trim();
   const names = raw.split(",").map(s => s.trim()).filter(Boolean);
   const count = Math.max(1, Math.min(50, parseInt($("#count").value || "1", 10)));
+  const level = $("#level").value;
   if (!names.length) { banner("请输入至少一个制品名"); return; }
 
   const jobs = [];
@@ -228,7 +255,7 @@ async function runQuery() {
     const t0 = performance.now();
     let res;
     try {
-      res = await jget(`/api/meta/${encodeURIComponent(name)}`);
+      res = await jget(`/api/meta/${encodeURIComponent(name)}?level=${encodeURIComponent(level)}`);
     } catch (e) {
       res = { status: 0, ok: false, body: { error: String(e) } };
     }
@@ -240,31 +267,50 @@ async function runQuery() {
   const wall = Math.round(performance.now() - started);
   $("#queryBtn").disabled = false;
 
-  const rejected = all.filter(x => x.status === 503).length;
+  const busy = all.filter(x => x.status === 503 && x.body.error === "capacity_busy").length;
+  const circuit = all.filter(x => x.status === 503 && x.body.error === "circuit_open").length;
   const failed = all.filter(x => x.status >= 500 && x.status !== 503).length;
-  banner(`完成 ${all.length} 个查询（墙钟 ${wall}ms）：成功 ${all.length - rejected - failed}，熔断拒绝 ${rejected}，上游失败 ${failed}`,
-         rejected || failed ? "warn" : "ok");
+  const ok = all.length - busy - circuit - failed;
+  const parts = [`完成 ${all.length} 个${level === "emergency" ? "紧急" : "普通"}查询（墙钟 ${wall}ms）`];
+  if (ok) parts.push(`成功 ${ok}`);
+  if (busy) parts.push(`容量忙碌 ${busy}`);
+  if (circuit) parts.push(`熔断拒绝 ${circuit}`);
+  if (failed) parts.push(`上游失败 ${failed}`);
+  banner(parts.join("，"), (busy || circuit || failed) ? "warn" : "ok");
   refresh();
 }
 
 function renderResult(idx, name, res, dt) {
   const b = res.body || {};
+  const busy = res.status === 503 && b.error === "capacity_busy";
   const rejected = res.status === 503 && b.error === "circuit_open";
   const ok = res.status === 200;
-  const cls = ok ? "ok" : rejected ? "rejected" : "fail";
+  const cls = ok ? "ok" : busy ? "busy" : rejected ? "rejected" : "fail";
   const label = ok ? pill("200 成功", "closed")
+    : busy ? pill("503 容量忙碌", "busy")
     : rejected ? pill("503 熔断拒绝", "open")
     : pill(`${res.status} 上游失败`, "half_open");
+  const levelPill = b.level
+    ? pill(b.level === "emergency" ? "紧急回滚" : "普通", b.level === "emergency" ? "emergency" : "normal")
+    : "";
   const role = b.role ? pill(b.role === "probe" ? "恢复探测" : "正常调用", b.role === "probe" ? "half_open" : "normal") : "";
   const who = `#${idx + 1} ${esc(name)} · worker ${esc(b.pid ?? "–")} · ${dt}ms`;
-  const meta = ok
-    ? `${role} ${pill("breaker: " + (b.breaker_state || "closed"), b.breaker_state || "closed")} ${pill(b.breaker_effect || "", "gray")} · 版本 ${esc(b.metadata?.metadata?.version ?? "–")}`
-    : `${role} ${rejected ? `重试约 ${esc(b.retry_after ?? "?")}s 后 · 状态 ${esc(b.state || "open")}` : esc(b.detail || b.error || "")} ${b.breaker_effect ? pill(b.breaker_effect, "gray") : ""}`;
+  let meta;
+  if (busy) {
+    meta = `${levelPill} ${pill(b.reason === "normal_capacity" ? "普通席已满" : "总席位已满", "gray")} ` +
+      `在途 ${esc(b.inflight)}/${esc(b.max_inflight)} · 普通 ${esc(b.normal_inflight)}/${esc(b.normal_max_inflight)} · 未访问目录`;
+  } else if (ok) {
+    meta = `${levelPill} ${role} ${pill("breaker: " + (b.breaker_state || "closed"), b.breaker_state || "closed")} ` +
+      `${pill(b.breaker_effect || "", "gray")} · 准入时在途 ${esc(b.capacity?.inflight_after_admit ?? "–")} ` +
+      `（普通 ${esc(b.capacity?.normal_inflight_after_admit ?? "–")}）· 版本 ${esc(b.metadata?.metadata?.version ?? "–")}`;
+  } else {
+    meta = `${levelPill} ${role} ${rejected ? `重试约 ${esc(b.retry_after ?? "?")}s 后 · 状态 ${esc(b.state || "open")}` : esc(b.detail || b.error || "")} ${b.breaker_effect ? pill(b.breaker_effect, "gray") : ""}`;
+  }
   const detail = (ok || b.metadata)
     ? `<pre>${esc(JSON.stringify(b.metadata ?? b, null, 2))}</pre>` : "";
   const div = document.createElement("div");
   div.className = `res ${cls}`;
-  div.innerHTML = `<div>${label} ${role}</div><div class="who">${who}</div><div class="meta">${meta}</div>${detail}`;
+  div.innerHTML = `<div>${label} ${levelPill} ${role}</div><div class="who">${who}</div><div class="meta">${meta}</div>${detail}`;
   $("#results").prepend(div);
 }
 
@@ -325,8 +371,28 @@ async function refresh() {
     const byMode = data.gateway_upstream?.by_mode || {};
     $("#gwHits").textContent = fmt(data.gateway_upstream?.hits ?? 0);
     $("#probeHits").textContent = fmt(byMode.probe ?? 0);
+
+    const cap = data.capacity || {};
+    $("#gwInflight").textContent = `${fmt(cap.inflight ?? 0)} / ${fmt(cap.max_inflight ?? 2)}`;
+    $("#gwPeak").textContent = fmt(cap.peak_inflight ?? 0);
+    $("#gwNormal").textContent = `${fmt(cap.normal_inflight ?? 0)} / ${fmt(cap.normal_max_inflight ?? 1)}`;
+    $("#gwBusy").textContent = fmt(cap.busy_rejected ?? 0);
+    const seatText = (cap.seats || []).map(s =>
+      `${s.level === "emergency" ? "紧急" : "普通"}:${s.artifact}@worker${s.pid}(${s.age_ms}ms${s.stale ? ",待回收" : ""})`
+    ).join("　") || "无占用";
+    $("#seatHint").textContent =
+      `保留席 ${fmt(cap.reserved_for_emergency ?? 1)} 个（紧急专用）· 累计放行 ${fmt(cap.admitted ?? 0)} · 当前席位：${seatText}`;
+
     const upstreamHits = await jget("/api/upstream-stats");
-    $("#upStreamHits").textContent = upstreamHits.ok ? fmt(upstreamHits.body.hits) : "不可达";
+    if (upstreamHits.ok) {
+      const u = upstreamHits.body;
+      $("#upStreamHits").textContent = fmt(u.hits);
+      $("#upInflight").textContent = `${fmt(u.inflight ?? 0)} / ${fmt(u.max_inflight ?? 2)}`;
+      $("#upPeak").textContent = fmt(u.peak_inflight ?? 0);
+      $("#upBusy").textContent = fmt(u.busy_rejected ?? 0);
+    } else {
+      $("#upStreamHits").textContent = "不可达";
+    }
 
     const events = (data.events || []).filter(e => e.kind !== "reset");
     $("#eventLog").innerHTML = events.map(e => {
@@ -350,7 +416,7 @@ $("#delay").addEventListener("change", () => { if (state.mode === "delay") apply
 $("#refreshStatsBtn").addEventListener("click", refresh);
 $("#resetUpstreamBtn").addEventListener("click", async () => { await jget("/api/upstream-stats/reset", { method: "POST" }); await refresh(); });
 $("#resetAllBtn").addEventListener("click", async () => {
-  if (!confirm("重置所有熔断状态与计数？")) return;
+  if (!confirm("重置所有熔断状态、容量席位与计数？")) return;
   await jget("/api/reset", { method: "POST" });
   await jget("/api/upstream-stats/reset", { method: "POST" });
   $("#results").innerHTML = ""; banner("已重置");

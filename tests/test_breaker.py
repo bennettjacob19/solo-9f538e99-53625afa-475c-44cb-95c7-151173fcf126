@@ -49,8 +49,27 @@ def script(responses: list[dict]) -> None:
     assert r.status_code == 200, r.text
 
 
-def meta(artifact: str = ART) -> httpx.Response:
-    return CLIENT.get(f"{GATEWAY}/api/meta/{artifact}")
+def meta(artifact: str = ART, level: str = "normal") -> httpx.Response:
+    return CLIENT.get(f"{GATEWAY}/api/meta/{artifact}?level={level}")
+
+
+def is_busy(resp: httpx.Response) -> bool:
+    return resp.status_code == 503 and resp.json().get("error") == "capacity_busy"
+
+
+def meta_admitted(artifact: str = ART, level: str = "normal", tries: int = 30) -> httpx.Response:
+    """Like ``meta`` but retries the immediate capacity-busy answer.
+
+    The gateway only lets 2 queries through at a time (1 ordinary), so bursty
+    tests must wait their turn.  Circuit-open 503s and other responses are
+    returned unchanged.
+    """
+    for attempt in range(tries):
+        resp = meta(artifact, level=level)
+        if not is_busy(resp):
+            return resp
+        time.sleep(0.15)
+    return resp
 
 
 def breaker(artifact: str = ART) -> dict:
@@ -77,7 +96,13 @@ def test_healthy_lookup_returns_metadata_and_is_spread_across_workers():
 
     def one(_: int) -> dict:
         with httpx.Client(timeout=10.0, headers={"Connection": "close"}) as client:
-            r = client.get(f"{GATEWAY}/api/meta/{ART}")
+            r = client.get(f"{GATEWAY}/api/meta/{ART}?level=normal")
+            # Only one ordinary query holds a seat at a time; wait our turn.
+            for _ in range(30):
+                if not (r.status_code == 503 and r.json().get("error") == "capacity_busy"):
+                    break
+                time.sleep(0.15)
+                r = client.get(f"{GATEWAY}/api/meta/{ART}?level=normal")
         assert r.status_code == 200, r.text
         return r.json()
 
@@ -140,17 +165,21 @@ def test_timeout_is_a_failure_and_bounded():
 def test_cooldown_admits_exactly_one_probe():
     set_mode("503")
     for _ in range(3):
-        meta()
+        meta_admitted()
     assert breaker()["state"] == "open"
     time.sleep(2.1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        results = list(pool.map(lambda _: meta(), range(10)))
+        results = list(pool.map(lambda _: meta(level="emergency"), range(10)))
 
     roles = [r.json().get("role") for r in results if r.json().get("role")]
-    rejected = [r for r in results if r.status_code == 503]
+    circuit_rejected = [
+        r for r in results
+        if r.status_code == 503 and r.json().get("error") == "circuit_open"
+    ]
+    busy = [r for r in results if is_busy(r)]
     assert roles.count("probe") == 1, f"exactly one probe expected, roles={roles}"
-    assert len(rejected) == 9
+    assert len(circuit_rejected) + len(busy) == 9
 
 
 def test_probe_failure_reopens_and_cooldown_restarts():
@@ -189,10 +218,13 @@ def test_slow_success_started_before_trip_cannot_recover():
             {"status": 503},
         ]
     )
+    # Emergency level lets both concurrent requests hold seats (the ordinary
+    # pool only admits one at a time); the breaker semantics under test are
+    # independent of query level.
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        slow = pool.submit(meta)
+        slow = pool.submit(meta, ART, "emergency")
         time.sleep(0.15)
-        fast = [meta() for _ in range(3)]
+        fast = [meta_admitted(ART, "emergency") for _ in range(3)]
         slow_resp = slow.result()
     assert fast[-1].json()["breaker_effect"] == "opened"
     assert slow_resp.status_code == 200
@@ -201,13 +233,111 @@ def test_slow_success_started_before_trip_cannot_recover():
 
 
 def test_slow_queries_do_not_block_each_other():
+    # Within the shared 2-seat cap, two slow queries must overlap rather than
+    # queue; extra burst traffic is answered immediately with capacity_busy.
     set_mode("delay", 0.7)
     started = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(lambda _: meta(), range(12)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: meta(level="emergency"), range(4)))
     elapsed = time.time() - started
-    assert all(r.status_code == 200 for r in results)
-    assert elapsed < 2.5, f"12 x 0.7s queries should overlap (took {elapsed:.2f}s)"
+    statuses = sorted(r.status_code for r in results)
+    assert 503 in statuses, "overflow traffic must get an immediate busy answer"
+    admitted = [r for r in results if not is_busy(r)]
+    assert len(admitted) == 2, f"only two seats exist, got {len(admitted)} admitted"
+    assert all(r.status_code == 200 for r in admitted)
+    assert elapsed < 1.6, f"the two admitted 0.7s queries should overlap (took {elapsed:.2f}s)"
+    assert all(
+        is_busy(r) for r in results if r.status_code == 503
+    ), "every 503 here must be a capacity rejection, not a breaker rejection"
+
+
+def test_ordinary_burst_admits_one_and_rejects_rest_without_touching_upstream():
+    set_mode("delay", 0.8)
+    hits_before = upstream_hits()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: meta(level="normal"), range(6)))
+    busy = [r for r in results if is_busy(r)]
+    admitted = [r for r in results if not is_busy(r)]
+    assert len(admitted) == 1, "ordinary queries share a single seat"
+    assert len(busy) == 5
+    body = busy[0].json()
+    assert body["error"] == "capacity_busy" and body["reason"] == "normal_capacity"
+    # Busy answers are local: the directory is never contacted for them.
+    assert upstream_hits() == hits_before + 1
+    snap = CLIENT.get(f"{GATEWAY}/api/capacity").json()
+    assert snap["inflight"] == 0, "the admitted request released its seat on timeout"
+    assert snap["busy_rejected"] >= 5
+    assert snap["peak_normal"] == 1
+
+
+def test_emergency_keeps_reserved_seat_under_ordinary_flood():
+    set_mode("delay", 0.8)
+    cap = f"{GATEWAY}/api/capacity"
+
+    def normal_hold() -> httpx.Response:
+        return meta(level="normal")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        holder = pool.submit(normal_hold)
+        # Wait until the ordinary seat is visibly held.
+        for _ in range(30):
+            snap = CLIENT.get(cap).json()
+            if snap["normal_inflight"] == 1:
+                break
+            time.sleep(0.05)
+        emergency = pool.submit(meta, "rollback-artifact.json", "emergency")
+        # The overflow is fired while both other requests are still in flight.
+        time.sleep(0.1)
+        overflow_normal = pool.submit(meta, level="normal")
+        hold_resp = holder.result()
+        em_resp = emergency.result()
+        overflow_resp = overflow_normal.result()
+
+    assert not is_busy(hold_resp), "the ordinary request holds the ordinary seat"
+    assert not is_busy(em_resp), "emergency rollback must use the reserved seat"
+    assert em_resp.json().get("level") == "emergency"
+    assert is_busy(overflow_resp)
+    # With the reserved seat also taken the total cap is hit; if the emergency
+    # request had already finished it is the ordinary cap instead.  Either way
+    # the overflow is an immediate, local busy answer.
+    assert overflow_resp.json()["reason"] in {"normal_capacity", "total_capacity"}
+
+
+def test_capacity_busy_never_counts_towards_breaker_nor_hits():
+    set_mode("503")
+    # Three *admitted* failures open the breaker; busy rejections in between
+    # must neither add failures nor contact the upstream.
+    for _ in range(3):
+        r = meta_admitted()
+        assert r.status_code == 502
+    assert breaker()["state"] == "open"
+    hits_before = upstream_hits()
+    for _ in range(5):
+        r = meta(level="normal")
+        assert r.status_code == 503
+        assert r.json()["error"] == "circuit_open"
+    assert upstream_hits() == hits_before
+    # Emergency traffic is breaker-rejected as well while OPEN, and still
+    # consumes no seat (so the recovery probe later has both seats available).
+    r = meta(level="emergency")
+    assert r.json()["error"] == "circuit_open"
+    assert CLIENT.get(f"{GATEWAY}/api/capacity").json()["inflight"] == 0
+
+
+def test_busy_rejection_does_not_become_recovery_probe():
+    set_mode("503")
+    for _ in range(3):
+        meta_admitted()
+    assert breaker()["state"] == "open"
+    time.sleep(2.1)
+    set_mode("normal")
+    # Flood at the exact cooldown boundary.  Exactly one request may become
+    # the probe; busy answers cannot pin the half-open slot.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: meta(level="emergency"), range(8)))
+    roles = [r.json().get("role") for r in results if r.json().get("role")]
+    assert roles.count("probe") == 1, f"one probe only, got {roles}"
+    assert breaker()["state"] == "closed"
 
 
 def test_persisted_state_survives_restart():

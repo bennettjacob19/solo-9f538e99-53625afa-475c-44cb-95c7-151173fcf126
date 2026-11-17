@@ -5,6 +5,13 @@ artifact) and exposes a control plane used by the demo web page to switch
 between healthy, slow and erroring behaviour.  It also counts every real
 ``/artifacts/*`` request, which is the ground truth for "did the gateway
 actually touch the upstream?".
+
+Shared-capacity protection
+---------------------------
+The directory itself processes at most ``MAX_INFLIGHT`` (default 2) queries at
+a time.  A request that finds the directory busy is answered immediately with
+503 (``error="directory_busy"``) without reading any artifact; the asyncio
+event loop is single-threaded, so the check-and-increment needs no lock.
 """
 
 from __future__ import annotations
@@ -21,6 +28,9 @@ from fastapi.responses import JSONResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACT_DIR = Path(os.environ.get("ARTIFACT_DIR", BASE_DIR / "artifacts"))
+# Hard concurrency cap of the example directory.  Queries above this get an
+# immediate 503 busy answer instead of queueing.
+MAX_INFLIGHT = int(os.environ.get("UPSTREAM_MAX_INFLIGHT", "2"))
 
 app = FastAPI(title="Example artifact directory service")
 
@@ -30,6 +40,11 @@ _mode: dict[str, Any] = {"mode": "normal", "delay": 3.0}
 # "serve": bool}.  When exhausted the upstream falls back to ``normal``.
 _script: list[dict[str, Any]] = []
 _stats: dict[str, Any] = {"hits": 0, "by_mode": {}, "last_requests": []}
+
+# Local (single-process) concurrency state of the directory.
+_inflight = 0
+_peak_inflight = 0
+_busy_rejected = 0
 
 
 def _bump(mode: str, artifact: str) -> None:
@@ -55,6 +70,32 @@ def _resolve(artifact: str) -> Path | None:
 
 @app.get("/artifacts/{artifact:path}")
 async def artifact_metadata(artifact: str, request: Request) -> JSONResponse:
+    global _inflight, _peak_inflight, _busy_rejected
+
+    # Shared-capacity guard: beyond MAX_INFLIGHT concurrent queries the
+    # directory answers immediately.  No file is read and no delay is applied.
+    if _inflight >= MAX_INFLIGHT:
+        _busy_rejected += 1
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "directory_busy",
+                "artifact": artifact,
+                "inflight": _inflight,
+                "max_inflight": MAX_INFLIGHT,
+            },
+        )
+
+    _inflight += 1
+    if _inflight > _peak_inflight:
+        _peak_inflight = _inflight
+    try:
+        return await _artifact_metadata(artifact, request)
+    finally:
+        _inflight -= 1
+
+
+async def _artifact_metadata(artifact: str, request: Request) -> JSONResponse:
     mode = _mode["mode"]
     scripted = _script.pop(0) if _script else None
     _bump(mode, artifact)
@@ -155,14 +196,22 @@ async def set_mode(request: Request) -> JSONResponse:
 
 @app.get("/control/stats")
 async def get_stats() -> dict[str, Any]:
-    return json.loads(json.dumps(_stats))
+    stats = json.loads(json.dumps(_stats))
+    stats["inflight"] = _inflight
+    stats["peak_inflight"] = _peak_inflight
+    stats["busy_rejected"] = _busy_rejected
+    stats["max_inflight"] = MAX_INFLIGHT
+    return stats
 
 
 @app.post("/control/reset")
 async def reset_stats() -> dict[str, Any]:
+    global _peak_inflight, _busy_rejected
     _stats["hits"] = 0
     _stats["by_mode"] = {}
     _stats["last_requests"] = []
+    _peak_inflight = _inflight
+    _busy_rejected = 0
     return {"ok": True}
 
 

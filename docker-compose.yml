@@ -13,6 +13,9 @@ services:
       - "9000"
     environment:
       ARTIFACT_DIR: /srv/artifacts
+      # The example directory itself processes at most 2 queries at a time;
+      # overflow is answered immediately with 503 directory_busy.
+      UPSTREAM_MAX_INFLIGHT: "2"
     expose:
       - "9000"
     healthcheck:
@@ -42,6 +45,11 @@ services:
       REQUEST_TIMEOUT: "1.0"
       COOLDOWN: "2.0"
       FAILURE_THRESHOLD: "3"
+      # Shared capacity across both workers: 2 in-flight seats total, at most
+      # one of them usable by ordinary queries (one seat reserved for
+      # emergency rollback lookups).
+      GATEWAY_MAX_INFLIGHT: "2"
+      GATEWAY_NORMAL_MAX_INFLIGHT: "1"
     ports:
       - "8000:8000"
     volumes:

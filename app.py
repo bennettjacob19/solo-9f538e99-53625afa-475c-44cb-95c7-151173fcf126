@@ -10,6 +10,31 @@ Architecture
 * A breaker failure is a connect failure, a timeout, or a 5xx response.  Any
   other completed response (2xx/3xx/4xx) resets the failure counter.
 
+Shared capacity protection
+--------------------------
+On top of the per-artifact breaker, the gateway enforces a process-wide
+capacity shared by both workers so that an on-call engineer can always get an
+emergency rollback artifact through, even when ordinary deploy traffic
+floods the directory:
+
+* At most ``GATEWAY_MAX_INFLIGHT`` (default 2) gateway queries may be in
+  flight towards the directory at any moment.
+* At most ``GATEWAY_NORMAL_MAX_INFLIGHT`` (default 1) of those seats may be
+  held by ordinary (``level=normal``) queries.  The remaining seat is
+  reserved for emergency (``level=emergency``) queries.
+* A request that cannot get a seat is answered immediately with 503
+  (``error="capacity_busy"``): the directory is never contacted, the breaker
+  is neither consulted for a probe nor updated, and nothing is counted as an
+  upstream hit.  A capacity rejection can therefore never occupy the recovery
+  probe slot.
+* Seat accounting lives in the same SQLite database, so the limit is global
+  across both workers.  Each acquisition returns an opaque token; releasing a
+  stale token is a no-op, so a late result can never free a seat a newer
+  request is holding.
+* Seats whose owning process has died, or whose lease (bounded by the 1s
+  request timeout) has expired, are reclaimed by later acquisitions and at
+  startup.  Timed-out requests release their seat in a ``finally`` block.
+
 Breaker semantics (per artifact name)
 -------------------------------------
 * CLOSED: calls pass through.  Failures are counted in completion order.  The
@@ -35,6 +60,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +78,15 @@ UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "http://upstream:9000").rstrip("/"
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "1.0"))
 COOLDOWN = float(os.environ.get("COOLDOWN", "2.0"))
 FAILURE_THRESHOLD = int(os.environ.get("FAILURE_THRESHOLD", "3"))
+# Shared gateway capacity: total in-flight seats, and the subset ordinary
+# (non-emergency) queries may occupy.  One seat stays reserved for emergency
+# rollback lookups.
+GATEWAY_MAX_INFLIGHT = int(os.environ.get("GATEWAY_MAX_INFLIGHT", "2"))
+GATEWAY_NORMAL_MAX_INFLIGHT = int(os.environ.get("GATEWAY_NORMAL_MAX_INFLIGHT", "1"))
+# A live request is bounded by REQUEST_TIMEOUT; any seat older than this lease
+# is considered abandoned (its worker died before releasing it).
+SEAT_LEASE = max(2.0, REQUEST_TIMEOUT + 1.0)
+LEVELS = ("normal", "emergency")
 # A live probe is bounded by REQUEST_TIMEOUT; anything older than this lease is
 # considered abandoned (e.g. its process died before writing a verdict).
 PROBE_LEASE = max(2.0, REQUEST_TIMEOUT + 1.0)
@@ -96,6 +131,25 @@ CREATE TABLE IF NOT EXISTS upstream_stats (
     hits_by_mode TEXT NOT NULL DEFAULT '{}'
 );
 INSERT OR IGNORE INTO upstream_stats (id, hits) VALUES (1, 0);
+-- One row per seat currently held by a gateway request.  Rows are inserted on
+-- admission and deleted on release; abandoned seats are reaped by lease.
+CREATE TABLE IF NOT EXISTS capacity_seats (
+    token       TEXT PRIMARY KEY,
+    level       TEXT NOT NULL,
+    artifact    TEXT NOT NULL,
+    pid         INTEGER NOT NULL,
+    instance_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL
+);
+-- Process-wide counters, shared by both workers.
+CREATE TABLE IF NOT EXISTS capacity_stats (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    admitted      INTEGER NOT NULL DEFAULT 0,
+    busy_rejected INTEGER NOT NULL DEFAULT 0,
+    peak_inflight INTEGER NOT NULL DEFAULT 0,
+    peak_normal   INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO capacity_stats (id) VALUES (1);
 """
 
 
@@ -287,6 +341,29 @@ def _fast_admission(row: sqlite3.Row, now: float) -> Optional[Admission]:
     return None  # cooldown elapsed: must take the write lock to elect the probe
 
 
+def peek_admission(artifact: str) -> Optional[Admission]:
+    """Read-only breaker check used *before* taking a capacity seat.
+
+    Returns a rejection while the breaker is OPEN (cooldown running) or
+    HALF_OPEN (probe in flight), an allow while CLOSED, or ``None`` when the
+    cooldown has just elapsed and electing the probe requires a write
+    transaction.  The write path (``admit``) runs only after a seat is held,
+    so a capacity-busy request can never become the recovery probe nor pin the
+    probe slot.
+    """
+    now = time.time()
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM breakers WHERE artifact = ?", (artifact,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return Admission(True, "normal", 0, state=CLOSED)
+    return _fast_admission(row, now)
+
+
 def record_outcome(artifact: str, adm: Admission, outcome: Outcome, hit_role: Optional[str] = None) -> dict[str, Any]:
     """Fold one completed upstream result into the shared state.
 
@@ -476,6 +553,178 @@ def get_gateway_hits() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Shared capacity seats (cross-worker, SQLite-backed)
+# ---------------------------------------------------------------------------
+
+
+def _pid_is_live(pid: int) -> bool:
+    """Whether another process (or this one) still exists and is not a zombie."""
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    # Zombies linger until their parent reaps them; kill(pid, 0) still works.
+    return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def _reap_dead_seats(conn: sqlite3.Connection, now: float) -> int:
+    """Delete seats abandoned by a dead worker or held past their lease."""
+    rows = conn.execute("SELECT token, pid, instance_id, acquired_at FROM capacity_seats").fetchall()
+    reaped = 0
+    for row in rows:
+        stale = False
+        if row["instance_id"] == INSTANCE_ID and row["pid"] == os.getpid():
+            stale = False  # our own seat, always considered live here
+        elif not _pid_is_live(row["pid"]):
+            stale = True
+        elif now - row["acquired_at"] > SEAT_LEASE:
+            stale = True
+        if stale:
+            conn.execute("DELETE FROM capacity_seats WHERE token = ?", (row["token"],))
+            reaped += 1
+    return reaped
+
+
+@dataclass
+class Seat:
+    token: str
+    level: str
+    inflight: int
+    normal_inflight: int
+
+
+@dataclass
+class CapacityBusy:
+    level: str
+    inflight: int
+    normal_inflight: int
+    reason: str  # "total_capacity" | "normal_capacity"
+
+
+def acquire_seat(level: str, artifact: str) -> Seat | CapacityBusy:
+    """Atomically take one shared seat, or report why none is available.
+
+    Runs inside one ``BEGIN IMMEDIATE`` transaction so the check-and-insert is
+    serialised across both worker processes.  Dead/expired seats are reaped
+    first.  On a busy decision nothing is inserted and no breaker data is
+    touched.
+    """
+    now = time.time()
+    with write_tx() as conn:
+        _reap_dead_seats(conn, now)
+        seats = conn.execute("SELECT level FROM capacity_seats").fetchall()
+        inflight = len(seats)
+        normal_inflight = sum(1 for s in seats if s["level"] == "normal")
+
+        if inflight >= GATEWAY_MAX_INFLIGHT:
+            conn.execute(
+                "UPDATE capacity_stats SET busy_rejected = busy_rejected + 1 WHERE id = 1"
+            )
+            return CapacityBusy(level, inflight, normal_inflight, "total_capacity")
+        if level == "normal" and normal_inflight >= GATEWAY_NORMAL_MAX_INFLIGHT:
+            conn.execute(
+                "UPDATE capacity_stats SET busy_rejected = busy_rejected + 1 WHERE id = 1"
+            )
+            return CapacityBusy(level, inflight, normal_inflight, "normal_capacity")
+
+        token = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO capacity_seats "
+            "(token, level, artifact, pid, instance_id, acquired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (token, level, artifact, os.getpid(), INSTANCE_ID, now),
+        )
+        inflight += 1
+        if level == "normal":
+            normal_inflight += 1
+        conn.execute(
+            "UPDATE capacity_stats SET admitted = admitted + 1, "
+            "peak_inflight = MAX(peak_inflight, ?), "
+            "peak_normal = MAX(peak_normal, ?) WHERE id = 1",
+            (inflight, normal_inflight),
+        )
+        return Seat(token, level, inflight, normal_inflight)
+
+
+def release_seat(token: str) -> None:
+    """Release exactly the seat identified by ``token``.
+
+    A token that no longer exists is a no-op: a late result from a request
+    whose seat was already reaped can never free a seat a newer request now
+    holds.
+    """
+    with write_tx() as conn:
+        conn.execute("DELETE FROM capacity_seats WHERE token = ?", (token,))
+
+
+def capacity_snapshot() -> dict[str, Any]:
+    now = time.time()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT level, artifact, pid, instance_id, acquired_at "
+            "FROM capacity_seats ORDER BY acquired_at"
+        ).fetchall()
+        stats = conn.execute(
+            "SELECT admitted, busy_rejected, peak_inflight, peak_normal "
+            "FROM capacity_stats WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    inflight = len(rows)
+    normal_inflight = sum(1 for r in rows if r["level"] == "normal")
+    seats = [
+        {
+            "level": r["level"],
+            "artifact": r["artifact"],
+            "pid": r["pid"],
+            "age_ms": round((now - r["acquired_at"]) * 1000, 1),
+            "stale": (
+                r["instance_id"] != INSTANCE_ID or r["pid"] != os.getpid()
+            )
+            and (not _pid_is_live(r["pid"]) or now - r["acquired_at"] > SEAT_LEASE),
+        }
+        for r in rows
+    ]
+    return {
+        "inflight": inflight,
+        "normal_inflight": normal_inflight,
+        "emergency_inflight": inflight - normal_inflight,
+        "max_inflight": GATEWAY_MAX_INFLIGHT,
+        "normal_max_inflight": GATEWAY_NORMAL_MAX_INFLIGHT,
+        "reserved_for_emergency": GATEWAY_MAX_INFLIGHT - GATEWAY_NORMAL_MAX_INFLIGHT,
+        "peak_inflight": stats["peak_inflight"],
+        "peak_normal": stats["peak_normal"],
+        "admitted": stats["admitted"],
+        "busy_rejected": stats["busy_rejected"],
+        "seat_lease": SEAT_LEASE,
+        "seats": seats,
+    }
+
+
+def _reset_capacity() -> None:
+    with write_tx() as conn:
+        conn.execute("DELETE FROM capacity_seats")
+        conn.execute(
+            "UPDATE capacity_stats SET admitted = 0, busy_rejected = 0, "
+            "peak_inflight = 0, peak_normal = 0 WHERE id = 1"
+        )
+
+
+def clean_stale_seats() -> None:
+    """Release seats left behind by dead workers at startup."""
+    now = time.time()
+    with write_tx() as conn:
+        _reap_dead_seats(conn, now)
+
+
+# ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
 
@@ -483,6 +732,7 @@ def get_gateway_hits() -> dict[str, Any]:
 async def lifespan(_: FastAPI):
     init_db()
     clean_stale_probes()
+    clean_stale_seats()
     try:
         yield
     finally:
@@ -505,62 +755,128 @@ def _finish(artifact: str, adm: Admission, outcome: Outcome, hit_role: Optional[
             ACTIVE_PROBES.discard(adm.holder)
 
 
+def _circuit_open_response(artifact: str, adm: Admission) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "artifact": artifact,
+            "error": "circuit_open",
+            "state": adm.state,
+            "retry_after": round(adm.retry_after, 3),
+            "pid": os.getpid(),
+        },
+        headers={"Retry-After": f"{max(0.0, adm.retry_after):.2f}"},
+    )
+
+
+def _capacity_busy_response(artifact: str, level: str, busy: CapacityBusy) -> JSONResponse:
+    """Immediate local answer: the directory is never touched, no breaker
+    counter or upstream-hit counter moves, and no probe can be elected here."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "artifact": artifact,
+            "error": "capacity_busy",
+            "reason": busy.reason,
+            "level": level,
+            "inflight": busy.inflight,
+            "normal_inflight": busy.normal_inflight,
+            "max_inflight": GATEWAY_MAX_INFLIGHT,
+            "normal_max_inflight": GATEWAY_NORMAL_MAX_INFLIGHT,
+            "pid": os.getpid(),
+        },
+        headers={"X-Capacity": "busy"},
+    )
+
+
 @app.get("/api/meta/{artifact:path}")
-async def get_meta(artifact: str) -> JSONResponse:
+async def get_meta(artifact: str, request: Request) -> JSONResponse:
     artifact = artifact.strip()
     if not artifact:
         raise HTTPException(status_code=400, detail="artifact name required")
 
+    # Query level: emergency rollback lookups may use the reserved seat.
+    level = request.query_params.get("level", "normal").strip().lower()
+    if level not in LEVELS:
+        raise HTTPException(status_code=400, detail="level must be one of normal, emergency")
+
+    # 1) Read-only breaker fast path.  OPEN/HALF_OPEN rejections happen before
+    #    any seat is taken; a CLOSED result cannot elect a probe here.
     try:
-        # SQLite writes serialise across processes; run them off the event loop
-        # so a request waiting on the write lock never stalls other queries in
-        # the same worker.
-        adm = await asyncio.to_thread(admit, artifact)
+        peek = await asyncio.to_thread(peek_admission, artifact)
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail=f"breaker store unavailable: {exc}") from exc
-    if not adm.allowed:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "artifact": artifact,
-                "error": "circuit_open",
-                "state": adm.state,
-                "retry_after": round(adm.retry_after, 3),
-                "pid": os.getpid(),
-            },
-            headers={"Retry-After": f"{max(0.0, adm.retry_after):.2f}"},
-        )
+    if peek is not None and not peek.allowed:
+        return _circuit_open_response(artifact, peek)
 
-    started = time.time()
+    # 2) Shared capacity gate.  A busy answer is fully local: no upstream
+    #    contact, no breaker write (so it can never be the recovery probe),
+    #    no upstream-hit accounting.
     try:
-        outcome = await call_upstream(artifact)
-    except asyncio.CancelledError:
-        # Client went away / server shutdown: release the probe slot and treat
-        # it as a failed probe so recovery can be retried later.
-        with contextlib.suppress(Exception):
-            await asyncio.shield(
-                asyncio.to_thread(
-                    _finish, artifact, adm, Outcome("failure", "cancelled"), None
+        seat_or_busy = await asyncio.to_thread(acquire_seat, level, artifact)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"breaker store unavailable: {exc}") from exc
+    if isinstance(seat_or_busy, CapacityBusy):
+        return _capacity_busy_response(artifact, level, seat_or_busy)
+    seat: Seat = seat_or_busy
+
+    try:
+        # 3) Full breaker admission now that a seat is held.  Only this write
+        #    transaction can elect the HALF_OPEN recovery probe.
+        try:
+            adm = await asyncio.to_thread(admit, artifact)
+        except sqlite3.Error as exc:
+            raise HTTPException(
+                status_code=503, detail=f"breaker store unavailable: {exc}"
+            ) from exc
+        if not adm.allowed:
+            return _circuit_open_response(artifact, adm)
+
+        started = time.time()
+        try:
+            outcome = await call_upstream(artifact)
+        except asyncio.CancelledError:
+            # Client went away / server shutdown: release the probe slot and
+            # treat it as a failed probe so recovery can be retried later.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        _finish, artifact, adm, Outcome("failure", "cancelled"), None
+                    )
                 )
-            )
-        raise
-    elapsed = time.time() - started
-    effect = await asyncio.to_thread(_finish, artifact, adm, outcome, adm.role)
+            raise
+        elapsed = time.time() - started
+        effect = await asyncio.to_thread(_finish, artifact, adm, outcome, adm.role)
+    finally:
+        # The seat is always released by the request that acquired it, and the
+        # token makes a late release a no-op if the seat was reaped meanwhile.
+        await asyncio.to_thread(release_seat, seat.token)
 
     body: dict[str, Any] = {
         "artifact": artifact,
+        "level": level,
         "role": adm.role,
         "upstream": outcome.kind,
         "detail": outcome.detail,
         "elapsed_ms": round(elapsed * 1000, 1),
         "breaker_effect": effect["effect"],
         "breaker_state": effect["state"],
+        "capacity": {
+            "inflight_after_admit": seat.inflight,
+            "normal_inflight_after_admit": seat.normal_inflight,
+            "max_inflight": GATEWAY_MAX_INFLIGHT,
+            "normal_max_inflight": GATEWAY_NORMAL_MAX_INFLIGHT,
+        },
         "pid": os.getpid(),
     }
     if outcome.payload is not None:
         body["metadata"] = outcome.payload
 
-    headers = {"X-Breaker-Role": adm.role, "X-Worker-Pid": str(os.getpid())}
+    headers = {
+        "X-Breaker-Role": adm.role,
+        "X-Worker-Pid": str(os.getpid()),
+        "X-Query-Level": level,
+    }
     if outcome.kind == "success":
         return JSONResponse(status_code=outcome.status or 200, content=body, headers=headers)
     return JSONResponse(status_code=502, content=body, headers=headers)
@@ -611,8 +927,14 @@ def _snapshot() -> dict[str, Any]:
         "breakers": items,
         "events": events,
         "gateway_upstream": get_gateway_hits(),
+        "capacity": capacity_snapshot(),
         "pid": os.getpid(),
     }
+
+
+@app.get("/api/capacity")
+async def capacity() -> dict[str, Any]:
+    return await asyncio.to_thread(capacity_snapshot)
 
 
 @app.post("/api/reset")
@@ -626,6 +948,11 @@ def _reset() -> None:
         conn.execute("DELETE FROM breakers")
         conn.execute("DELETE FROM events")
         conn.execute("UPDATE upstream_stats SET hits = 0, hits_by_mode = '{}' WHERE id = 1")
+        conn.execute("DELETE FROM capacity_seats")
+        conn.execute(
+            "UPDATE capacity_stats SET admitted = 0, busy_rejected = 0, "
+            "peak_inflight = 0, peak_normal = 0 WHERE id = 1"
+        )
         log_event(conn, "*", "reset")
 
 
